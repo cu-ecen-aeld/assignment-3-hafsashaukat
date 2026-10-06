@@ -6,6 +6,9 @@
 #include <errno.h>
 #include <signal.h>
 #include <syslog.h>
+#include <pthread.h>
+#include <sys/queue.h>
+#include <time.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -18,6 +21,18 @@
 
 static volatile sig_atomic_t caught_signal = 0;
 static int server_fd = -1;
+static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+struct thread_data {
+    pthread_t thread_id;
+    int client_fd;
+    char client_ip[INET6_ADDRSTRLEN];
+    bool thread_complete;
+    SLIST_ENTRY(thread_data) entries;
+};
+
+SLIST_HEAD(thread_list, thread_data);
+static struct thread_list threads = SLIST_HEAD_INITIALIZER(threads);
 
 // signal handler for SIGINT and SIGTERM
 static void signal_handler(int signo)
@@ -111,9 +126,67 @@ static int append_packet(const char *packet, size_t length)
     return 0;
 }
 
-// receive data from one client
-static int handle_client(int client_fd)
+// append a timestamp to DATA_FILE every 10 seconds
+static void *timestamp_thread(void *arg)
 {
+    (void)arg;
+
+    while (!caught_signal) {
+
+        // wait 10 seconds between timestamp writes
+        for (int i = 0; i < 10 && !caught_signal; i++) {
+            sleep(1);
+        }
+
+        if (caught_signal) {
+            break;
+        }
+
+        time_t current_time = time(NULL);
+
+        if (current_time == (time_t)-1) {
+            syslog(LOG_ERR, "time failed");
+            continue;
+        }
+
+        struct tm time_info;
+
+        if (localtime_r(&current_time, &time_info) == NULL) {
+            syslog(LOG_ERR, "localtime_r failed");
+            continue;
+        }
+
+        char timestamp[128];
+
+        size_t length = strftime(timestamp,
+                                 sizeof(timestamp),
+                                 "timestamp:%a, %d %b %Y %H:%M:%S %z\n",
+                                 &time_info);
+
+        if (length == 0) {
+            syslog(LOG_ERR, "strftime failed");
+            continue;
+        }
+
+        // protect timestamp writes from client file access
+        pthread_mutex_lock(&file_mutex);
+
+        if (append_packet(timestamp, length) != 0) {
+            syslog(LOG_ERR, "Could not append timestamp");
+        }
+
+        pthread_mutex_unlock(&file_mutex);
+    }
+
+    return NULL;
+}
+
+// receive data from one client
+static void *handle_client(void *arg)
+{
+    struct thread_data *data = (struct thread_data *)arg;
+    int client_fd = data->client_fd;
+
     char recv_buffer[BUFFER_SIZE];
 
     char *packet = NULL;
@@ -138,8 +211,7 @@ static int handle_client(int client_fd)
             }
 
             syslog(LOG_ERR, "recv failed: %s", strerror(errno));
-            free(packet);
-            return -1;
+            goto cleanup;
         }
 
         for (ssize_t i = 0; i < received; i++) {
@@ -148,8 +220,7 @@ static int handle_client(int client_fd)
 
             if (new_packet == NULL) {
                 syslog(LOG_ERR, "realloc failed");
-                free(packet);
-                return -1;
+                goto cleanup;
             }
 
             packet = new_packet;
@@ -157,25 +228,39 @@ static int handle_client(int client_fd)
 
             if (recv_buffer[i] == '\n') {
 
-                if (append_packet(packet, packet_length) != 0) {
-                    free(packet);
-                    return -1;
-                }
+    		// protect file access from other client threads
+    		pthread_mutex_lock(&file_mutex);
 
-                if (send_file_to_client(client_fd) != 0) {
-                    free(packet);
-                    return -1;
-                }
+    		if (append_packet(packet, packet_length) != 0) {
+        		pthread_mutex_unlock(&file_mutex);
+        		goto cleanup;
+    		}
 
-                free(packet);
-                packet = NULL;
-                packet_length = 0;
-            }
+    		if (send_file_to_client(client_fd) != 0) {
+        		pthread_mutex_unlock(&file_mutex);
+        		goto cleanup;
+    		}
+
+    		pthread_mutex_unlock(&file_mutex);
+
+    		free(packet);
+    		packet = NULL;
+    		packet_length = 0;
+	   }
         }
     }
 
+cleanup:
     free(packet);
-    return 0;
+
+    close(client_fd);
+    data->client_fd = -1;
+
+    syslog(LOG_DEBUG, "Closed connection from %s", data->client_ip);
+
+    data->thread_complete = true;
+
+    return NULL;
 }
 
 int main(int argc, char *argv[])
@@ -188,6 +273,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Usage: %s [-d]\n", argv[0]);
         return -1;
     }
+
     struct addrinfo hints;
     struct addrinfo *server_info = NULL;
 
@@ -314,8 +400,47 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    // create the thread which writes timestamps every 10 seconds
+	pthread_t timestamp_thread_id;
+
+	int timestamp_status =
+    		pthread_create(&timestamp_thread_id,
+                   NULL,
+                   timestamp_thread,
+                   NULL);
+
+	if (timestamp_status != 0) {
+    		syslog(LOG_ERR,
+           	"pthread_create for timestamp failed: %s",
+           	strerror(timestamp_status));
+
+    		close(server_fd);
+    		closelog();
+    		return -1;
+	}
+
     // continue accepting clients until SIGINT or SIGTERM
     while (!caught_signal) {
+
+        // join and remove any client threads which have completed
+	struct thread_data *thread = SLIST_FIRST(&threads);
+
+	while (thread != NULL) {
+    		struct thread_data *next = SLIST_NEXT(thread, entries);
+
+    		if (thread->thread_complete) {
+        		pthread_join(thread->thread_id, NULL);
+
+        		SLIST_REMOVE(&threads,
+                     		thread,
+                     		thread_data,
+                     		entries);
+
+        		free(thread);
+    		}
+
+    		thread = next;
+	}
 
         struct sockaddr_storage client_address;
         socklen_t client_length = sizeof(client_address);
@@ -360,11 +485,45 @@ int main(int argc, char *argv[])
 
         syslog(LOG_DEBUG, "Accepted connection from %s", client_ip);
 
-        handle_client(client_fd);
+        // allocate information for the new client thread
+        struct thread_data *new_thread =
+            malloc(sizeof(struct thread_data));
 
-        close(client_fd);
+        if (new_thread == NULL) {
+            syslog(LOG_ERR, "malloc failed for client thread");
+            close(client_fd);
+            continue;
+        }
 
-        syslog(LOG_DEBUG, "Closed connection from %s", client_ip);
+        new_thread->client_fd = client_fd;
+        new_thread->thread_complete = false;
+
+        strncpy(new_thread->client_ip,
+                client_ip,
+                sizeof(new_thread->client_ip) - 1);
+
+        new_thread->client_ip[
+            sizeof(new_thread->client_ip) - 1] = '\0';
+
+        // create a new thread to handle this client connection
+        int thread_status =
+            pthread_create(&new_thread->thread_id,
+                           NULL,
+                           handle_client,
+                           new_thread);
+
+        if (thread_status != 0) {
+            syslog(LOG_ERR,
+                   "pthread_create failed: %s",
+                   strerror(thread_status));
+
+            close(client_fd);
+            free(new_thread);
+            continue;
+        }
+
+        // add the new thread to the linked list
+        SLIST_INSERT_HEAD(&threads, new_thread, entries);
     }
 
     syslog(LOG_DEBUG, "Caught signal, exiting");
@@ -374,7 +533,31 @@ int main(int argc, char *argv[])
         server_fd = -1;
     }
 
+    // request an exit from each active client thread by shutting down
+    struct thread_data *thread;
+
+    SLIST_FOREACH(thread, &threads, entries) {
+        if (thread->client_fd != -1) {
+            shutdown(thread->client_fd, SHUT_RDWR);
+        }
+    }
+
+    // wait for all client threads to complete
+    while (!SLIST_EMPTY(&threads)) {
+        thread = SLIST_FIRST(&threads);
+
+        pthread_join(thread->thread_id, NULL);
+
+        SLIST_REMOVE_HEAD(&threads, entries);
+        free(thread);
+    }
+
+    // wait for the timestamp thread to finish
+    pthread_join(timestamp_thread_id, NULL);
+
     unlink(DATA_FILE);
+
+    pthread_mutex_destroy(&file_mutex);
 
     closelog();
 

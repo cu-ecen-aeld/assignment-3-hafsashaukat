@@ -1,5 +1,5 @@
 CC = $(CROSS_COMPILE)gcc
-CFLAGS = -Wall -Werror
+CFLAGS = -Wall -Werror -pthread
 TARGET = aesdsocket
 
 .PHONY: all default clean
