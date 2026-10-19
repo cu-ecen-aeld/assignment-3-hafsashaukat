@@ -16,7 +16,17 @@
 #include <arpa/inet.h>
 
 #define PORT "9000"
+
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
+#if USE_AESD_CHAR_DEVICE
+#define DATA_FILE "/dev/aesdchar"
+#else
 #define DATA_FILE "/var/tmp/aesdsocketdata"
+#endif
+
 #define BUFFER_SIZE 1024
 
 static volatile sig_atomic_t caught_signal = 0;
@@ -126,6 +136,8 @@ static int append_packet(const char *packet, size_t length)
     return 0;
 }
 
+#if !USE_AESD_CHAR_DEVICE
+
 // append a timestamp to DATA_FILE every 10 seconds
 static void *timestamp_thread(void *arg)
 {
@@ -180,6 +192,8 @@ static void *timestamp_thread(void *arg)
 
     return NULL;
 }
+
+#endif
 
 // receive data from one client
 static void *handle_client(void *arg)
@@ -400,6 +414,7 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+#if !USE_AESD_CHAR_DEVICE
     // create the thread which writes timestamps every 10 seconds
 	pthread_t timestamp_thread_id;
 
@@ -418,6 +433,8 @@ int main(int argc, char *argv[])
     		closelog();
     		return -1;
 	}
+
+#endif
 
     // continue accepting clients until SIGINT or SIGTERM
     while (!caught_signal) {
@@ -552,10 +569,13 @@ int main(int argc, char *argv[])
         free(thread);
     }
 
+#if !USE_AESD_CHAR_DEVICE
     // wait for the timestamp thread to finish
     pthread_join(timestamp_thread_id, NULL);
 
+    // remove the temporary data file
     unlink(DATA_FILE);
+#endif
 
     pthread_mutex_destroy(&file_mutex);
 

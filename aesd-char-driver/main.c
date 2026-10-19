@@ -18,10 +18,15 @@
 #include <linux/cdev.h>
 #include <linux/fs.h> // file_operations
 #include "aesdchar.h"
+#include <linux/kernel.h>
+#include <linux/uaccess.h>
+#include <linux/errno.h>
+#include <linux/slab.h>
+
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
 
-MODULE_AUTHOR("Your Name Here"); /** TODO: fill in your name **/
+MODULE_AUTHOR("Hafsa Shaukat"); /** TODO: fill in your name **/
 MODULE_LICENSE("Dual BSD/GPL");
 
 struct aesd_dev aesd_device;
@@ -32,6 +37,14 @@ int aesd_open(struct inode *inode, struct file *filp)
     /**
      * TODO: handle open
      */
+    // get the aesd device structure associated with this inode
+    struct aesd_dev *dev;
+
+    dev = container_of(inode->i_cdev, struct aesd_dev, cdev);
+
+    // store the device pointer for future read and write operations
+    filp->private_data = dev;
+
     return 0;
 }
 
@@ -41,29 +54,149 @@ int aesd_release(struct inode *inode, struct file *filp)
     /**
      * TODO: handle release
      */
+
+    // no additional cleanup is needed when closing the device
     return 0;
 }
 
 ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
                 loff_t *f_pos)
 {
+	struct aesd_dev *dev = filp->private_data;
+	struct aesd_buffer_entry *entry;
+	size_t entry_offset = 0;
+	size_t bytes_to_copy;
     ssize_t retval = 0;
     PDEBUG("read %zu bytes with offset %lld",count,*f_pos);
-    /**
-     * TODO: handle read
-     */
+    if (*f_pos < 0)
+        return -EINVAL;
+
+    if (mutex_lock_interruptible(&dev->lock))
+        return -ERESTARTSYS;
+
+    // find the buffer entry corresponding to the current file offset
+    entry = aesd_circular_buffer_find_entry_offset_for_fpos(
+        &dev->buffer, *f_pos, &entry_offset);
+
+    if (entry == NULL) {
+        // no more data available
+        goto out;
+    }
+
+    // limit the read to the current entry and requested count
+    bytes_to_copy = min(count, entry->size - entry_offset);
+
+    // copy the data from kernel space to user space
+    if (copy_to_user(buf, entry->buffptr + entry_offset, bytes_to_copy)) {
+        retval = -EFAULT;
+        goto out;
+    }
+
+    // update the file offset
+    *f_pos += bytes_to_copy;
+    retval = bytes_to_copy;
+
+out:
+    mutex_unlock(&dev->lock);
     return retval;
 }
 
 ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
                 loff_t *f_pos)
 {
-    ssize_t retval = -ENOMEM;
+	struct aesd_dev *dev = filp->private_data;
+	struct aesd_buffer_entry entry;
+	char *new_buffer;
+	char *newline;
+	char *user_data;
+	size_t total_size;
+	size_t command_size;
+	size_t remaining_size;
+    ssize_t retval = count;
     PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
-    /**
-     * TODO: handle write
-     */
-    return retval;
+
+    if (count == 0)
+	    return 0;
+
+    if (mutex_lock_interruptible(&dev->lock))
+	    return -ERESTARTSYS;
+
+    // check for overflow before allocating memory
+    if (count > SIZE_MAX - dev->pending_size) {
+	    retval = -ENOMEM;
+	    goto out;
+    }
+
+    total_size = dev->pending_size + count;
+
+    // copy user data into temporary kernel memory first
+    user_data = memdup_user(buf, count);
+    if (IS_ERR(user_data)) {
+	    retval = PTR_ERR(user_data);
+	    goto out;
+    }
+
+    // allocate memory for the pending data and new write
+    new_buffer = krealloc(dev->pending_write, total_size, GFP_KERNEL);
+
+    if (!new_buffer) {
+	    kfree(user_data);
+	    retval = -ENOMEM;
+	    goto out;
+    }
+
+    dev->pending_write = new_buffer;
+
+    // append the validated user data to the pending command
+    memcpy(dev->pending_write + dev->pending_size, user_data, count);
+    kfree(user_data);
+
+    dev->pending_size = total_size;
+
+    // process each completed newline-terminated command
+    while ((newline = memchr(dev->pending_write, '\n',
+                             dev->pending_size)) != NULL) {
+
+        command_size = newline - dev->pending_write + 1;
+        remaining_size = dev->pending_size - command_size;
+
+        // allocate memory for the completed command
+        entry.buffptr = kmalloc(command_size, GFP_KERNEL);
+        if (!entry.buffptr) {
+		retval = -ENOMEM;
+		goto out;
+        }
+
+        memcpy((void *)entry.buffptr, dev->pending_write, command_size);
+        entry.size = command_size;
+
+        // free the oldest command when the buffer is full
+        if (dev->buffer.full) {
+		kfree(dev->buffer.entry[dev->buffer.in_offs].buffptr);
+        }
+
+        aesd_circular_buffer_add_entry(&dev->buffer, &entry);
+
+        // keep any data remaining after the completed command
+        if (remaining_size > 0) {
+		memmove(dev->pending_write,
+				dev->pending_write + command_size, 
+				remaining_size);
+        }
+	
+	dev->pending_size = remaining_size;
+    }
+
+    // release pending storage when no incomplete command remains
+    if (dev->pending_size == 0) {
+	    kfree(dev->pending_write);
+	    dev->pending_write = NULL;
+    }
+
+out:
+	mutex_unlock(&dev->lock);
+    	return retval;
+    
 }
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
@@ -105,6 +238,15 @@ int aesd_init_module(void)
     /**
      * TODO: initialize the AESD specific portion of the device
      */
+    // initialize the circular buffer
+    aesd_circular_buffer_init(&aesd_device.buffer);
+
+    // initialize the mutex
+    mutex_init(&aesd_device.lock);
+
+    // initialize pending write storage
+    aesd_device.pending_write = NULL;
+    aesd_device.pending_size = 0;
 
     result = aesd_setup_cdev(&aesd_device);
 
@@ -117,6 +259,7 @@ int aesd_init_module(void)
 
 void aesd_cleanup_module(void)
 {
+	int i;
     dev_t devno = MKDEV(aesd_major, aesd_minor);
 
     cdev_del(&aesd_device.cdev);
@@ -124,6 +267,16 @@ void aesd_cleanup_module(void)
     /**
      * TODO: cleanup AESD specific poritions here as necessary
      */
+    // free all completed commands stored in the circular buffer
+    for (i = 0; i < AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED; i++) {
+        kfree(aesd_device.buffer.entry[i].buffptr);
+    }
+
+    // free any incomplete write command
+    kfree(aesd_device.pending_write);
+
+    // destroy the mutex
+    mutex_destroy(&aesd_device.lock);
 
     unregister_chrdev_region(devno, 1);
 }
