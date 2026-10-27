@@ -15,10 +15,19 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 
+#include <fcntl.h>
+#include <stdint.h>
+#include <limits.h>
+#include <sys/ioctl.h>
+
 #define PORT "9000"
 
 #ifndef USE_AESD_CHAR_DEVICE
 #define USE_AESD_CHAR_DEVICE 1
+#endif
+
+#if USE_AESD_CHAR_DEVICE
+#include "../aesd-char-driver/aesd_ioctl.h"
 #endif
 
 #if USE_AESD_CHAR_DEVICE
@@ -115,6 +124,57 @@ static int send_file_to_client(int client_fd)
     return 0;
 }
 
+#if USE_AESD_CHAR_DEVICE
+
+static int handle_ioctl_command(int client_fd,
+                                unsigned int write_cmd,
+                                unsigned int write_cmd_offset)
+{
+    	int fd;
+    	char buffer[BUFFER_SIZE];
+    	ssize_t bytes_read;
+
+    	struct aesd_seekto seekto = {
+        	.write_cmd = write_cmd,
+        	.write_cmd_offset = write_cmd_offset
+    	};
+
+    	// open the device only when processing a request
+    	fd = open(DATA_FILE, O_RDONLY);
+
+    	if (fd < 0) {
+        	syslog(LOG_ERR, "Could not open %s: %s",
+               		DATA_FILE, strerror(errno));
+        	return -1;
+    	}
+
+    	// move the device file position to the requested command
+    	if (ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto) < 0) {
+        	syslog(LOG_ERR, "ioctl failed: %s", strerror(errno));
+        	close(fd);
+        	return -1;
+    	}
+
+    	// read using the same file descriptor after ioctl
+    	while ((bytes_read = read(fd, buffer, sizeof(buffer))) > 0) {
+		if (send_all(client_fd, buffer, (size_t)bytes_read) != 0) {
+            		close(fd);
+            		return -1;
+        	}
+    	}
+
+    	if (bytes_read < 0) {
+        	syslog(LOG_ERR, "Device read failed: %s", strerror(errno));
+        	close(fd);
+        	return -1;
+    	}
+
+    	close(fd);
+    	return 0;
+}
+
+#endif
+
 // append one complete packet to DATA_FILE
 static int append_packet(const char *packet, size_t length)
 {
@@ -195,87 +255,148 @@ static void *timestamp_thread(void *arg)
 
 #endif
 
+
 // receive data from one client
 static void *handle_client(void *arg)
 {
-    struct thread_data *data = (struct thread_data *)arg;
-    int client_fd = data->client_fd;
+	struct thread_data *data = (struct thread_data *)arg;
+    	int client_fd = data->client_fd;
 
-    char recv_buffer[BUFFER_SIZE];
+    	char recv_buffer[BUFFER_SIZE];
 
-    char *packet = NULL;
-    size_t packet_length = 0;
+    	char *packet = NULL;
+    	size_t packet_length = 0;
 
-    while (!caught_signal) {
-        ssize_t received = recv(client_fd,
-                                recv_buffer,
-                                sizeof(recv_buffer),
-                                0);
+    	while (!caught_signal) {
+        	ssize_t received = recv(client_fd,
+                                	recv_buffer,
+                                	sizeof(recv_buffer),
+                                	0);
 
-        if (received == 0) {
-            break;
-        }
+        	if (received == 0) {
+            		break;
+        	}
 
-        if (received < 0) {
-            if (errno == EINTR) {
-                if (caught_signal) {
-                    break;
+        	if (received < 0) {
+            		if (errno == EINTR) {
+                		if (caught_signal) {
+                    			break;
+                		}
+                		continue;
+            		}
+
+            		syslog(LOG_ERR, "recv failed: %s", strerror(errno));
+            		goto cleanup;
+        	}
+
+        	// process received bytes until a newline is found
+        	for (ssize_t i = 0; i < received; i++) {
+
+            		char *new_packet = realloc(packet, packet_length + 1);
+
+            		if (new_packet == NULL) {
+                		syslog(LOG_ERR, "realloc failed");
+                		goto cleanup;
+            		}
+
+            		packet = new_packet;
+            		packet[packet_length++] = recv_buffer[i];
+
+            		// a complete newline-terminated packet was received
+            		if (recv_buffer[i] == '\n') {
+
+                		// protect device access from other client threads
+                		pthread_mutex_lock(&file_mutex);
+
+				#if USE_AESD_CHAR_DEVICE
+
+                		// Check for an AESDCHAR_IOCSEEKTO command
+                		const char *prefix = "AESDCHAR_IOCSEEKTO:";
+                		size_t prefix_length = strlen(prefix);
+
+                		if (packet_length >= prefix_length &&
+                    			memcmp(packet, prefix, prefix_length) == 0) {
+
+                    			unsigned int write_cmd;
+                   		 	unsigned int write_cmd_offset;
+                    			char extra;
+
+                    			// Allocate a null-terminated command string
+                    			char *command = malloc(packet_length + 1);
+
+                    			if (command == NULL) {
+                        			pthread_mutex_unlock(&file_mutex);
+                        			goto cleanup;
+                    			}
+
+                    			memcpy(command, packet, packet_length);
+                    			command[packet_length] = '\0';
+
+                    			// parse the write command and byte offset
+                    			if (sscanf(command,
+                               		"AESDCHAR_IOCSEEKTO:%u,%u%c",
+                               		&write_cmd,
+                               		&write_cmd_offset,
+                               		&extra) != 3 ||
+                        		extra != '\n') {
+						syslog(LOG_ERR,
+                               				"Invalid AESDCHAR_IOCSEEKTO command");
+
+                        			free(command);
+                        			pthread_mutex_unlock(&file_mutex);
+                        			goto cleanup;
+                    			}
+
+                    			free(command);
+
+                    			// execute ioctl and read from the same descriptor
+                    			if (handle_ioctl_command(client_fd,
+                                             	write_cmd,
+                                             	write_cmd_offset) != 0) {
+						pthread_mutex_unlock(&file_mutex);
+                        			goto cleanup;
+                    			}
+
+                		} else
+
+				#endif
+
+                {
+                    	// normal packet: append it to the device/file
+                    	if (append_packet(packet, packet_length) != 0) {
+                        	pthread_mutex_unlock(&file_mutex);
+                        	goto cleanup;
+                    	}
+
+                    	// send stored contents back to the client
+                    	if (send_file_to_client(client_fd) != 0) {
+                        	pthread_mutex_unlock(&file_mutex);
+                        	goto cleanup;
+                    	}
                 }
-                continue;
+
+                pthread_mutex_unlock(&file_mutex);
+
+                // reset the packet buffer for the next command
+                free(packet);
+                packet = NULL;
+                packet_length = 0;
             }
-
-            syslog(LOG_ERR, "recv failed: %s", strerror(errno));
-            goto cleanup;
-        }
-
-        for (ssize_t i = 0; i < received; i++) {
-
-            char *new_packet = realloc(packet, packet_length + 1);
-
-            if (new_packet == NULL) {
-                syslog(LOG_ERR, "realloc failed");
-                goto cleanup;
-            }
-
-            packet = new_packet;
-            packet[packet_length++] = recv_buffer[i];
-
-            if (recv_buffer[i] == '\n') {
-
-    		// protect file access from other client threads
-    		pthread_mutex_lock(&file_mutex);
-
-    		if (append_packet(packet, packet_length) != 0) {
-        		pthread_mutex_unlock(&file_mutex);
-        		goto cleanup;
-    		}
-
-    		if (send_file_to_client(client_fd) != 0) {
-        		pthread_mutex_unlock(&file_mutex);
-        		goto cleanup;
-    		}
-
-    		pthread_mutex_unlock(&file_mutex);
-
-    		free(packet);
-    		packet = NULL;
-    		packet_length = 0;
-	   }
         }
     }
 
 cleanup:
-    free(packet);
+    	free(packet);
 
-    close(client_fd);
-    data->client_fd = -1;
+    	// close this client's socket
+    	close(client_fd);
 
-    syslog(LOG_DEBUG, "Closed connection from %s", data->client_ip);
+    	// mark this thread as completed for the main thread
+    	data->thread_complete = true;
 
-    data->thread_complete = true;
-
-    return NULL;
+    	return NULL;
 }
+
 
 int main(int argc, char *argv[])
 {
